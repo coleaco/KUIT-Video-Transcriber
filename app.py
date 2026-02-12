@@ -184,17 +184,17 @@ max_cards = st.sidebar.slider("Max flashcards to generate", 5, 100, MAX_CANDIDAT
 sort_choice = st.sidebar.selectbox("Sort by", ["Frequency in transcript (desc), then rank", "Alphabetical (A→Z)", "Rank (asc)"])
 use_llm = st.sidebar.checkbox("Use LLM for definitions/examples (requires OPENAI_API_KEY in Secrets)", value=False)
 
-st.sidebar.markdown("**Frequency list file expected:** `italian_frequency_list.csv` in app folder (columns: `word,rank`).")
+st.sidebar.markdown("**Frequency list file expected:** `it_frequency_list.csv` in app folder (columns: `word,rank`).")
 
 # Frequency list loader
 @st.cache_data(show_spinner=False)
 def _load_freq():
-    return load_frequency_list("italian_frequency_list.csv")
+    return load_frequency_list("it_frequency_list.csv")
 
 try:
     freq_df = _load_freq()
 except FileNotFoundError:
-    st.error("Could not find `italian_frequency_list.csv`. Please upload it to the app folder.")
+    st.error("Could not find `it_frequency_list.csv`. Please upload it to the app folder.")
     st.stop()
 
 # Main controls
