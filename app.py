@@ -1,67 +1,50 @@
+
 import os
 import re
-import io
+import json
 from urllib.parse import urlparse, parse_qs
+from typing import List, Dict
 
 import streamlit as st
 import pandas as pd
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from collections import Counter
 
-# ---------------------------
-# Configuration
-# ---------------------------
-APP_TITLE = "Italian Vocab from YouTube (500–20,000 rank)"
-DEFAULT_MIN_RANK = 500
-DEFAULT_MAX_RANK = 20000
-MAX_CANDIDATES_DEFAULT = 20
+# ========= App Config =========
+APP_TITLE = "Italian Vocab from YouTube — LLM-Only"
+MAX_CONTEXT_CHARS = 12000   # cap transcript length sent to LLM
+DEFAULT_MAX_CARDS = 18
 
-# Minimal Italian stopword set (you can expand this or load from a file)
-ITALIAN_STOPWORDS = {
-    "di","a","da","in","con","su","per","tra","fra","e","o","ma","anche","che","come","dove","quando","perché","piu","più","meno",
-    "il","lo","la","i","gli","le","un","uno","una","mi","ti","si","ci","vi","ne","dei","degli","delle","del","dello","della","dai",
-    "dalle","dagli","dall","al","allo","alla","ai","agli","alle","questo","questa","questi","queste","quello","quella","quelli",
-    "quelle","qui","lì","là","quindi","se","non","c","l","d","s"
-}
-
-# ---------------------------
-# Helper functions
-# ---------------------------
+# ========= Helpers =========
 
 def extract_video_id(url_or_id: str) -> str | None:
-    """Extract an 11-char YouTube video ID from a URL or return the input if it already looks like an ID."""
+    """Extract an 11-char YouTube ID from a URL, or accept a bare ID."""
     url_or_id = url_or_id.strip()
-    # If user pasted a bare ID
     if re.match(r"^[\w-]{11}$", url_or_id):
         return url_or_id
-
     try:
         parsed = urlparse(url_or_id)
-        # youtu.be/<id>
         if parsed.netloc in ("youtu.be", "www.youtu.be"):
             vid = parsed.path.lstrip("/")
             return vid if re.match(r"^[\w-]{11}$", vid) else None
-        # youtube.com/watch?v=<id>
         if parsed.netloc in ("youtube.com", "www.youtube.com", "m.youtube.com"):
             if parsed.path == "/watch":
                 v = parse_qs(parsed.query).get("v", [None])[0]
                 return v if v and re.match(r"^[\w-]{11}$", v) else None
-            # /shorts/<id>
             if parsed.path.startswith("/shorts/"):
-                vid = parsed.path.split("/")[2] if len(parsed.path.split("/")) > 2 else parsed.path.split("/")[1]
-                return vid if re.match(r"^[\w-]{11}$", vid) else None
+                parts = [p for p in parsed.path.split("/") if p]
+                vid = parts[1] if len(parts) > 1 else None
+                return vid if vid and re.match(r"^[\w-]{11}$", vid) else None
     except Exception:
         return None
     return None
 
+@st.cache_data(show_spinner=False)
 def fetch_transcript_text(video_id: str, preferred_langs=('it','it-IT','en')) -> str | None:
     """
-    Try to fetch transcript in preferred languages order.
-    Works with manually provided or auto-generated captions and requires no API key.
-    Returns raw joined text or None if unavailable.
+    Try to fetch a transcript (manual or auto captions) in preferred language order.
+    No API key is required for youtube-transcript-api.
     """
     try:
-        # Try the simple API first
         for lang in preferred_langs:
             try:
                 entries = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
@@ -75,201 +58,179 @@ def fetch_transcript_text(video_id: str, preferred_langs=('it','it-IT','en')) ->
         return None
 
 def normalize(text: str) -> str:
-    text = text.lower()
-    # remove timestamps (already not present) & extra whitespace
+    text = text.replace("\u200b", " ").strip()
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return text
 
-def tokenize_words(text: str) -> list[str]:
-    # Keep Italian accented letters as word chars
-    words = re.findall(r"[a-zA-ZàèéìòóùÀÈÉÌÒÓÙ]+", text, flags=re.UNICODE)
-    return [w.lower() for w in words]
+def build_flashcard_prompt(transcript: str, max_items: int, level: str) -> str:
+    """
+    Ask the LLM to select the most pedagogically useful vocabulary
+    and return STRICT JSON for easy parsing and CSV export.
+    """
+    # Trim to avoid excessive token usage; we still give rich context
+    transcript = transcript[:MAX_CONTEXT_CHARS]
 
-def load_frequency_list(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    # Expect columns: word, rank
-    df["word"] = df["word"].astype(str).str.lower()
-    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-    df = df.dropna(subset=["rank"])
-    return df
+    return f"""
+You are an expert Italian language tutor.
 
-def filter_by_rank(tokens: list[str], freq_df: pd.DataFrame, min_rank: int, max_rank: int) -> pd.DataFrame:
-    counts = Counter([t for t in tokens if t not in ITALIAN_STOPWORDS])
-    if not counts:
-        return pd.DataFrame(columns=["word","count","rank"])
+Task:
+1) Read the Italian transcript below.
+2) Choose up to {max_items} vocabulary ITEMS (single words or multi‑word expressions) that are valuable to study for an {level} learner.
+3) For each item, generate a high‑quality flashcard.
 
-    cand_df = pd.DataFrame(counts.items(), columns=["word", "count"])
-    merged = cand_df.merge(freq_df, on="word", how="left")
-    # Keep those with rank in the desired band
-    band = merged[(merged["rank"] >= min_rank) & (merged["rank"] <= max_rank)]
-    # If rank missing, drop
-    band = band.dropna(subset=["rank"])
-    # Strong default sort: first by descending in-text count, then ascending rank
-    band = band.sort_values(by=["count", "rank"], ascending=[False, True])
-    return band
+Selection criteria:
+- Only include items that APPEAR in the transcript.
+- Prefer items that are meaningful for understanding, moderately challenging, reusable, and thematically relevant.
+- Include a mix of verbs, nouns, adjectives/adverbs, and idiomatic/multi‑word expressions when appropriate.
+- Avoid articles, simple pronouns, very basic function words, and extremely rare proper names.
 
-def make_flashcard_prompt(word: str) -> str:
-    return f"""Create a concise Italian vocabulary flashcard for: {word}
-Include:
-- Italian word
-- Part of speech
-- English translation
-- One simple Italian example sentence (A2–B1)
-- English gloss of that sentence
-Format as:
-**{word}** (POS) — <English translation>
-IT: <Italian example>
-EN: <English gloss>
+Output format (STRICT JSON ONLY, no markdown, no extra text):
+[
+  {{
+    "term_it": "…",            // the Italian word/expression exactly as it appears
+    "pos": "…",                // part of speech (e.g., verb, noun, adj, expr)
+    "translation_en": "…",     // concise English gloss/translation
+    "example_it": "…",         // simple example sentence in Italian (A2–B1)
+    "gloss_en": "…",           // English gloss of the example
+    "rationale": "…"           // 1-line note on pedagogical/value/difficulty
+  }},
+  ...
+]
+
+Transcript:
+{transcript}
 """
 
-def generate_flashcard_with_llm(word: str, transcript_context: str | None = None) -> str:
+def call_llm_for_flashcards(transcript: str, max_items: int, level: str, temperature: float = 0.3) -> List[Dict]:
     """
-    Uses OpenAI-compatible Chat Completions if OPENAI_API_KEY is present in Streamlit secrets.
-    If no key, returns a templated fallback card.
+    Uses an OpenAI-compatible Chat Completions API (via OPENAI_API_KEY in secrets).
+    Returns a list of flashcard dicts, or raises an exception with an informative message.
     """
     api_key = st.secrets.get("OPENAI_API_KEY", None)
-    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")  # you can change this in Streamlit secrets
+    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
     if not api_key:
-        # Fallback card (no external call)
-        return f"**{word}** (POS) — <translation>\nIT: <example sentence>\nEN: <gloss>\n"
+        raise RuntimeError("Missing OPENAI_API_KEY in Streamlit Secrets. Add it via the app menu: ⋮ → Edit secrets.")
 
+    # Lazy import to keep the app working even if the package isn't installed locally
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    prompt = build_flashcard_prompt(transcript, max_items, level)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role":"user","content":prompt}],
+        temperature=temperature,
+    )
+    raw = resp.choices[0].message.content.strip()
+
+    # Try to parse JSON. If it fails, raise an informative error showing a snippet.
     try:
-        # Import here so app still runs without openai installed (when user doesn't toggle LLM)
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
-        base_prompt = make_flashcard_prompt(word)
-        if transcript_context:
-            base_prompt += f"\nContext (excerpt from transcript):\n{transcript_context[:800]}"
-
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": base_prompt}],
-            temperature=0.4,
-        )
-        return resp.choices[0].message.content.strip()
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("LLM response is not a JSON list.")
+        # Basic schema check
+        required = {"term_it","pos","translation_en","example_it","gloss_en","rationale"}
+        for i, item in enumerate(data):
+            if not isinstance(item, dict) or not required.issubset(item.keys()):
+                raise ValueError(f"Item {i} missing required keys. Found keys: {list(item.keys())}")
+        return data
     except Exception as e:
-        st.warning(f"LLM error for '{word}': {e}")
-        return f"**{word}** (POS) — <translation>\nIT: <example sentence>\nEN: <gloss>\n"
+        # Allow the user to see raw output if JSON parse fails
+        raise ValueError(f"Could not parse LLM JSON. Error: {e}\nRaw output (first 800 chars): {raw[:800]}")
+
+def flashcards_to_dataframe(cards: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(cards)
+    # Ensure consistent column order
+    cols = ["term_it","pos","translation_en","example_it","gloss_en","rationale"]
+    return df[cols]
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """
-    Export two columns CSV suitable for flashcard tools (Front/Back).
-    Here we place the Italian word on the Front and a combined Back.
-    """
-    export = pd.DataFrame({
-        "Front": df["word"],
-        "Back": df["flashcard"]
+    # Export Front/Back for Anki and keep a richer CSV as well
+    export_basic = pd.DataFrame({
+        "Front": df["term_it"],
+        "Back": df.apply(lambda r: f"({r['pos']}) — {r['translation_en']}<br><br>"
+                                   f"IT: {r['example_it']}<br>"
+                                   f"EN: {r['gloss_en']}", axis=1)
     })
-    return export.to_csv(index=False).encode("utf-8")
+    return export_basic.to_csv(index=False).encode("utf-8")
 
-# ---------------------------
-# UI
-# ---------------------------
+
+# ========= UI =========
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 st.markdown(
-    "Paste a **YouTube** link, set your **frequency band**, and generate flashcards. "
-    "If the video has captions (manual or auto), the transcript can be fetched without any API key. "
-    "You can optionally use an LLM API key (OpenAI-compatible) to generate definitions/examples.",
+    "Paste a **YouTube** link (or a transcript). The app fetches captions when available, "
+    "sends the text to an LLM, and returns **curated vocabulary flashcards**—no frequency list needed."
 )
 
-# Sidebar settings
+# Sidebar controls
 st.sidebar.header("Settings")
-min_rank = st.sidebar.number_input("Min rank", value=DEFAULT_MIN_RANK, min_value=1, max_value=500000, step=50)
-max_rank = st.sidebar.number_input("Max rank", value=DEFAULT_MAX_RANK, min_value=1, max_value=500000, step=50)
-max_cards = st.sidebar.slider("Max flashcards to generate", 5, 100, MAX_CANDIDATES_DEFAULT, step=5)
-sort_choice = st.sidebar.selectbox("Sort by", ["Frequency in transcript (desc), then rank", "Alphabetical (A→Z)", "Rank (asc)"])
-use_llm = st.sidebar.checkbox("Use LLM for definitions/examples (requires OPENAI_API_KEY in Secrets)", value=False)
+max_cards = st.sidebar.slider("Number of flashcards", 6, 30, DEFAULT_MAX_CARDS, step=2)
+level = st.sidebar.selectbox("Learner level focus", ["A2", "B1", "B2"])
+temperature = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.3, 0.1)
+show_rationales = st.sidebar.checkbox("Show rationale/why this item was chosen", value=False)
 
-st.sidebar.markdown("**Frequency list file expected:** `it_frequency_list.csv` in app folder (columns: `word,rank`).")
+st.sidebar.markdown(
+    "**Tip:** Add your `OPENAI_API_KEY` (and optional `OPENAI_MODEL`) via the app menu **⋮ → Edit secrets**."
+)
 
-# Frequency list loader
-@st.cache_data(show_spinner=False)
-def _load_freq():
-    return load_frequency_list("it_frequency_list.csv")
+# Inputs
+youtube_url = st.text_input("YouTube URL (or 11-character ID)")
+manual_text = st.text_area("Or paste the Italian transcript here (overrides URL if filled)", height=180)
 
-try:
-    freq_df = _load_freq()
-except FileNotFoundError:
-    st.error("Could not find `it_frequency_list.csv`. Please upload it to the app folder.")
-    st.stop()
-
-# Main controls
-youtube_url = st.text_input("YouTube URL (or 11-character video ID)")
-manual_text = st.text_area("Or paste Italian transcript text here (will override URL if filled)", height=180)
-
-if st.button("Generate vocabulary"):
-    raw_text = None
-    context_snippet = None
-
+if st.button("Generate flashcards"):
+    # 1) Get transcript text
     if manual_text.strip():
         raw_text = manual_text.strip()
     else:
         vid = extract_video_id(youtube_url)
         if not vid:
-            st.error("Please paste a valid YouTube link or the 11-character video ID.")
+            st.error("Please paste a valid YouTube link or an 11-character video ID, or paste the transcript.")
             st.stop()
-
-        with st.spinner("Fetching transcript..."):
+        with st.spinner("Fetching transcript…"):
             raw_text = fetch_transcript_text(vid)
         if not raw_text:
-            st.warning("No transcript available (captions disabled or not provided). "
-                       "Paste transcript text manually, or choose a different video.")
+            st.warning("No transcript available (captions disabled or missing). Paste the transcript text manually, or choose a different video.")
             st.stop()
 
-    norm = normalize(raw_text)
-    tokens = tokenize_words(norm)
+    transcript = normalize(raw_text)
 
-    with st.spinner("Finding candidate vocabulary..."):
-        band_df = filter_by_rank(tokens, freq_df, min_rank=min_rank, max_rank=max_rank)
-        if band_df.empty:
-            st.info("No words matched the specified frequency band. Try widening the range.")
+    # 2) LLM: select vocab & produce flashcards
+    with st.spinner("Asking the LLM to curate vocabulary and build flashcards…"):
+        try:
+            cards = call_llm_for_flashcards(transcript, max_cards, level, temperature=temperature)
+        except Exception as e:
+            st.error(str(e))
             st.stop()
 
-        # Apply sort choice
-        if sort_choice == "Alphabetical (A→Z)":
-            band_df = band_df.sort_values(by="word", ascending=True)
-        elif sort_choice == "Rank (asc)":
-            band_df = band_df.sort_values(by="rank", ascending=True)
-        # else keep default
-
-        # Limit the number of candidates
-        band_df = band_df.head(max_cards)
-
-    st.subheader("Candidate words")
-    st.dataframe(band_df[["word", "count", "rank"]].reset_index(drop=True), use_container_width=True)
-
-    # Optional context snippet for better examples
-    context_snippet = norm[:1200]
+    # 3) Display
+    df = flashcards_to_dataframe(cards)
 
     st.subheader("Flashcards")
-    cards = []
-    for w in band_df["word"]:
-        # For performance, keep the context short
-        if use_llm:
-            card = generate_flashcard_with_llm(w, transcript_context=context_snippet)
-        else:
-            card = f"**{w}** (POS) — <translation>\nIT: <example sentence>\nEN: <gloss>\n"
-        cards.append(card)
-        st.markdown(card)
+    for _, r in df.iterrows():
+        st.markdown(
+            f"**{r['term_it']}** ({r['pos']}) — {r['translation_en']}\n\n"
+            f"**IT:** {r['example_it']}\n\n"
+            f"**EN:** {r['gloss_en']}\n"
+        )
+        if show_rationales:
+            st.caption(f"Why this item: {r['rationale']}")
 
-    export_df = band_df[["word"]].copy()
-    export_df["flashcard"] = cards
+    st.subheader("Table view")
+    st.dataframe(df, use_container_width=True)
 
-    # Download CSV (Anki-friendly)
+    # 4) Download CSV for Anki (Front/Back)
     st.download_button(
-        label="⬇️ Download CSV (Front=Italian word, Back=flashcard)",
-        data=df_to_csv_bytes(export_df),
+        label="⬇️ Download CSV for Anki (Front=term_it, Back=definition+examples)",
+        data=df_to_csv_bytes(df),
         file_name="italian_flashcards.csv",
         mime="text/csv",
     )
 
 st.markdown("---")
 st.caption(
-    "Transcripts are obtained via the open-source **youtube-transcript-api** "
-    "(works for manual or auto-generated captions; no API key required). "
-    "If a video lacks captions, paste the transcript manually. "
+    "Transcripts are retrieved via the open-source `youtube-transcript-api` (manual or auto captions; no YouTube API key required). "
+    "If a video lacks captions, paste the transcript text manually."
 )
